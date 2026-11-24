@@ -278,3 +278,8 @@ fn input_length_fixtures() {
 fn large_loop_fixtures() {
     assert_fixture_pair("large-loop", "large-loop");
 }
+
+#[test]
+fn release_profile_not_optimized_fixtures() {
+    assert_fixture_pair("release-profile", "release-profile-not-optimized");
+}

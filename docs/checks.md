@@ -804,3 +804,37 @@ Passing a zero or negative token amount to a transfer or mint call can result in
 - Validation performed inside a helper function called by the flagged method is not visible to this check.
 
 **Fixture:** tests in `crates/checks/src/unchecked_token_amount.rs`
+
+---
+
+## `release-profile-not-optimized` (Low)
+
+**What it detects**
+
+In Rust files containing `#[contract]` or `#[contractimpl]`, checks the crate's `[profile.release]` and custom Cargo profiles for these size-oriented settings:
+
+```toml
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = "symbols"
+```
+
+Each missing or contrary setting is reported separately. Custom profiles are checked independently, with settings inherited from another profile applied before evaluating them.
+
+**Why it matters**
+
+Soroban contracts are deployed as WASM, so smaller artifacts reduce upload cost and help fit practical ledger-entry size limits. Size optimization also makes whole-program optimization more effective and removes panic-unwind support that contracts do not need.
+
+**How to fix**
+
+Add the recommended keys to `[profile.release]`, or to the custom profile used to build the contract. For a workspace member, put profile settings in the workspace root `Cargo.toml`.
+
+**Limitations**
+
+- This is a manifest-level heuristic: it does not confirm which Cargo profile a deployment actually uses or inspect the resulting WASM.
+- Only Rust files with a contract annotation are considered; no findings are produced for ordinary library crates.
+- Workspace profiles are inherited only for workspace members. Package membership is determined from the workspace's `members` / `exclude` entries or the package's explicit `package.workspace` path.
+- The recommended `strip = "symbols"` value is checked as configured; toolchain-specific strip behavior is not analyzed.

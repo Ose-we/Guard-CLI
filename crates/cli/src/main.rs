@@ -996,6 +996,13 @@ const CHECK_METADATA: &[CheckMeta] = &[
         rule: "Authorization check occurs after a storage write",
         long: Some("Reports functions that perform a storage write before their require_auth call, so unauthorized callers can still cause state changes."),
     },
+    CheckMeta {
+        name: "release-profile-not-optimized",
+        severity: "low",
+        short: "Flags Soroban contract release profiles missing WASM size optimizations",
+        rule: "Contract Cargo profile is missing size-oriented release settings",
+        long: Some("Reports contract crates whose release or custom Cargo profiles are missing opt-level = \"z\", lto = true, panic = \"abort\", codegen-units = 1, or strip = \"symbols\". Workspace profile settings are used for workspace members."),
+    },
 ];
 
 fn check_meta(name: &str) -> Option<&'static CheckMeta> {

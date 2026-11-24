@@ -19,6 +19,7 @@ pub mod missing_nonce;
 pub mod overflow;
 pub mod panics;
 pub mod reentrancy;
+pub mod release_profile_not_optimized;
 pub mod reinit;
 pub mod std_imports;
 pub mod storage;
@@ -55,6 +56,7 @@ pub use missing_nonce::MissingNonceCheck;
 pub use overflow::UncheckedArithmeticCheck;
 pub use panics::PanicInContractCheck;
 pub use reentrancy::ReentrancyRiskCheck;
+pub use release_profile_not_optimized::ReleaseProfileNotOptimizedCheck;
 pub use reinit::ReInitializationRiskCheck;
 pub use std_imports::ForbiddenStdImportsCheck;
 pub use storage::UnsafeStoragePatternsCheck;
@@ -127,9 +129,30 @@ pub struct Finding {
 }
 
 /// A static analyzer check implemented against a parsed `syn::File`.
+#[derive(Default)]
+pub struct CheckContext<'a> {
+    /// The nearest Cargo package manifest, when one is available.
+    pub manifest: Option<&'a toml::Value>,
+    /// The Cargo workspace root manifest, when this package is a workspace member.
+    pub workspace_manifest: Option<&'a toml::Value>,
+}
+
 pub trait Check {
     fn name(&self) -> &str;
     fn run(&self, file: &File, source: &str) -> Vec<Finding>;
+
+    fn needs_context(&self, _file: &File) -> bool {
+        false
+    }
+
+    fn run_with_context(
+        &self,
+        file: &File,
+        source: &str,
+        _context: &CheckContext<'_>,
+    ) -> Vec<Finding> {
+        self.run(file, source)
+    }
 }
 
 /// Group a flat findings slice by `file_path`.
@@ -230,6 +253,7 @@ fn all_checks_base() -> Vec<Box<dyn Check + Send + Sync>> {
         Box::new(ReentrancyRiskCheck),
         Box::new(MissingEventForAdminChangeCheck),
         Box::new(MissingInputLengthBoundCheck),
+        Box::new(ReleaseProfileNotOptimizedCheck),
     ]
 }
 
