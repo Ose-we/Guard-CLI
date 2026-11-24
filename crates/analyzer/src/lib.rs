@@ -6,7 +6,7 @@
 use rayon::prelude::*;
 use serde::Serialize;
 use soroban_guard_checks::util::contractimpl_functions_with_type_excluding_test;
-use soroban_guard_checks::{default_checks, Check, Finding};
+use soroban_guard_checks::{default_checks, Check, CheckContext, Finding};
 use std::collections::HashSet;
 use std::io::BufRead;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -55,6 +55,13 @@ pub enum ScanError {
     },
     #[error("Failed to parse {path}: {message}")]
     Parse { path: PathBuf, message: String },
+    #[error("Failed to read Cargo manifest {path}: {source}")]
+    ManifestRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to parse Cargo manifest {path}: {message}")]
+    ManifestParse { path: PathBuf, message: String },
     #[error("Check `{check}` panicked on {path}: {message}")]
     CheckPanic {
         check: String,
@@ -196,6 +203,108 @@ fn has_generated_file_header(path: &Path) -> Result<bool, std::io::Error> {
     Ok(false)
 }
 
+#[derive(Default)]
+struct ManifestContext {
+    manifest: Option<toml::Value>,
+    workspace_manifest: Option<toml::Value>,
+}
+
+fn read_manifest(path: &Path) -> Result<Option<toml::Value>, ScanError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let source = std::fs::read_to_string(path).map_err(|source| ScanError::ManifestRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let value = toml::from_str(&source).map_err(|error| ScanError::ManifestParse {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(Some(value))
+}
+
+fn manifest_context_for_file(path: &Path) -> Result<ManifestContext, ScanError> {
+    let Some(parent) = path.parent() else {
+        return Ok(ManifestContext::default());
+    };
+    let nearest = parent
+        .ancestors()
+        .map(|directory| directory.join("Cargo.toml"))
+        .find(|manifest| manifest.is_file());
+    let Some(nearest_path) = nearest else {
+        return Ok(ManifestContext::default());
+    };
+    let Some(nearest_manifest) = read_manifest(&nearest_path)? else {
+        return Ok(ManifestContext::default());
+    };
+    let mut context = ManifestContext {
+        manifest: Some(nearest_manifest.clone()),
+        workspace_manifest: None,
+    };
+
+    if nearest_manifest.get("workspace").is_some() {
+        context.workspace_manifest = Some(nearest_manifest);
+        return Ok(context);
+    }
+
+    if let Some(workspace_path) = nearest_manifest
+        .get("package")
+        .and_then(|package| package.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        let workspace_manifest = Path::new(workspace_path)
+            .is_absolute()
+            .then(|| PathBuf::from(workspace_path))
+            .unwrap_or_else(|| nearest_path.parent().unwrap_or(parent).join(workspace_path))
+            .join("Cargo.toml");
+        context.workspace_manifest = read_manifest(&workspace_manifest)?;
+        return Ok(context);
+    }
+
+    let member_dir = nearest_path.parent().unwrap_or(parent);
+    for directory in member_dir.ancestors().skip(1) {
+        let workspace_path = directory.join("Cargo.toml");
+        let Some(workspace_manifest) = read_manifest(&workspace_path)? else {
+            continue;
+        };
+        if workspace_manifest.get("workspace").is_some()
+            && is_workspace_member(&workspace_manifest, directory, member_dir)
+        {
+            context.workspace_manifest = Some(workspace_manifest);
+            break;
+        }
+    }
+    Ok(context)
+}
+
+fn is_workspace_member(
+    workspace_manifest: &toml::Value,
+    workspace_dir: &Path,
+    member_dir: &Path,
+) -> bool {
+    let relative = member_dir
+        .strip_prefix(workspace_dir)
+        .unwrap_or(member_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let workspace = workspace_manifest.get("workspace");
+    let matches_patterns = |field: &str| {
+        workspace
+            .and_then(|workspace| workspace.get(field))
+            .and_then(toml::Value::as_array)
+            .is_some_and(|patterns| {
+                patterns.iter().filter_map(toml::Value::as_str).any(|pattern| {
+                    glob::Pattern::new(pattern).is_ok_and(|compiled| {
+                        compiled.matches(&relative)
+                            || compiled.matches_path(Path::new(&relative))
+                    })
+                })
+            })
+    };
+    matches_patterns("members") && !matches_patterns("exclude")
+}
+
 /// Parses `// soroban-guard: allow(a, b)`. Whitespace is optional after `//` and on
 /// either side of `:` (`//soroban-guard:allow(x)` and `//  soroban-guard : allow(x)` are
 /// accepted); `///` and `//!` doc comments are not suppressions.
@@ -303,23 +412,6 @@ fn is_suppressed(finding: &Finding, suppressions: &Suppressions, fn_spans: &[FnS
     ))
 }
 
-/// The path relative to `root` shown in findings: the bare file name when `root`
-/// itself is a single file, otherwise the path stripped of the `root` prefix.
-/// Shared by every scan entry point so the copies of this logic can't drift (issue #630).
-fn file_label(path: &Path, root: &Path) -> String {
-    if root.is_file() {
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    } else {
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string()
-    }
-}
-
 /// Drop only findings that are identical in everything a reader would use to tell
 /// them apart. Keying on `(file, line, check_name)` alone collapsed distinct
 /// same-line findings from checks that legitimately report more than once per line
@@ -373,13 +465,13 @@ pub fn is_ignored_path(path: &Path) -> bool {
         .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git")))
 }
 
-/// The path relative to `root` shown in findings: the bare file name when `root`
-
 /// Path used to sort a [`ScanError`] for deterministic multi-error reporting (#629).
 fn scan_error_path(err: &ScanError) -> PathBuf {
     match err {
         ScanError::ScanRoot { path, .. }
         | ScanError::PermissionDenied { path }
+        | ScanError::ManifestRead { path, .. }
+        | ScanError::ManifestParse { path, .. }
         | ScanError::IoRead { path, .. }
         | ScanError::Parse { path, .. }
         | ScanError::CheckPanic { path, .. }
@@ -419,7 +511,8 @@ fn collect_scan_results<T>(results: Vec<Result<T, ScanError>>) -> Result<Vec<T>,
 fn compile_globs(patterns: &[String]) -> Result<Vec<glob::Pattern>, ScanError> {
     let mut compiled = Vec::with_capacity(patterns.len());
     for p in patterns {
-        match glob::Pattern::new(p) {
+        let normalized = p.replace('\\', "/");
+        match glob::Pattern::new(&normalized) {
             Ok(pattern) => compiled.push(pattern),
             Err(e) => {
                 return Err(ScanError::InvalidGlobPattern {
@@ -445,7 +538,12 @@ enum PathVerdict {
 fn glob_hit(patterns: &[glob::Pattern], label: &Path, path: &Path) -> bool {
     patterns
         .iter()
-        .any(|p| p.matches_path(label) || p.matches_path(path))
+        .any(|p| {
+            p.matches_path(label)
+                || p.matches_path(path)
+                || p.matches(&path_to_report_string(label))
+                || p.matches(&path_to_report_string(path))
+        })
 }
 
 /// The single filter every scan entry point applies to a candidate source file:
@@ -566,6 +664,15 @@ fn run_checks_for_file(
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
+    let manifest_context = if checks.iter().any(|check| check.needs_context(&syn_file)) {
+        manifest_context_for_file(path)?
+    } else {
+        ManifestContext::default()
+    };
+    let check_context = CheckContext {
+        manifest: manifest_context.manifest.as_ref(),
+        workspace_manifest: manifest_context.workspace_manifest.as_ref(),
+    };
     let file_label = file_label(path, root);
     let fn_spans = build_fn_spans(&syn_file);
     let suppressions = parse_suppressions(&content, &fn_spans);
@@ -574,7 +681,9 @@ fn run_checks_for_file(
     let mut check_panics: Vec<ScanError> = Vec::new();
     for check in checks {
         let check_name = check.name().to_string();
-        match catch_unwind(AssertUnwindSafe(|| check.run(&syn_file, &content))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            check.run_with_context(&syn_file, &content, &check_context)
+        })) {
             Ok(mut hits) => {
                 for finding in &mut hits {
                     finding.file_path.clone_from(&file_label);
@@ -704,39 +813,33 @@ pub fn scan_directory_with_checks(
 
 /// Report-friendly path: lossy UTF-8 with `/` separators on every platform.
 fn path_to_report_string(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-}
-
-/// Label a finding's file relative to the scan root (or by file name when the
-/// root is itself a file).
-fn file_label(path: &Path, root: &Path) -> String {
-    if root.is_file() {
-        path.file_name()
-            .map(Path::new)
-            .map(path_to_report_string)
-            .unwrap_or_default()
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = normalized.strip_prefix("//?/") {
+        if let Some((prefix, unc_path)) = rest.split_once('/') {
+            if prefix.eq_ignore_ascii_case("UNC") {
+                return format!("//{unc_path}");
+            }
+        }
+        rest.to_string()
     } else {
-        path_to_report_string(path.strip_prefix(root).unwrap_or(path))
+        normalized
     }
 }
 
-/// Report-friendly path: lossy UTF-8 with `/` separators on every platform.
-fn path_to_report_string(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-}
-
 /// Label a finding's file relative to the scan root (or by file name when the
 /// root is itself a file).
 fn file_label(path: &Path, root: &Path) -> String {
-    if root.is_file() {
-        path.file_name()
-            .map(Path::new)
-            .map(path_to_report_string)
-            .unwrap_or_default()
+    let path = path_to_report_string(path);
+    let root_label = path_to_report_string(root);
+    if root.is_file() || path == root_label {
+        path.rsplit('/').next().unwrap_or_default().to_string()
     } else {
-        path_to_report_string(path.strip_prefix(root).unwrap_or(path))
+        let root_prefix = if root_label.ends_with('/') {
+            root_label.clone()
+        } else {
+            format!("{root_label}/")
+        };
+        path.strip_prefix(&root_prefix).unwrap_or(&path).to_string()
     }
 }
 
@@ -850,6 +953,160 @@ mod tests {
         assert!(is_ignored_path(Path::new("crate/target/debug/build.rs")));
         assert!(is_ignored_path(Path::new(".git/hooks/pre-commit.rs")));
         assert!(!is_ignored_path(Path::new("crate/src/lib.rs")));
+    }
+
+    #[test]
+    fn file_labels_normalize_drive_unc_and_verbatim_paths() {
+        assert_eq!(
+            file_label(
+                Path::new(r"C:\proj\src\lib.rs"),
+                Path::new(r"C:\proj")
+            ),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            file_label(
+                Path::new(r"\\server\share\proj\src\lib.rs"),
+                Path::new(r"\\server\share\proj")
+            ),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            path_to_report_string(Path::new(r"\\?\C:\proj\src\lib.rs")),
+            "C:/proj/src/lib.rs"
+        );
+        assert_eq!(
+            path_to_report_string(Path::new(r"\\?\UNC\server\share\src\lib.rs")),
+            "//server/share/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn windows_style_include_and_exclude_globs_match_paths() {
+        let include = compile_globs(&[r"src\**\*.rs".to_string()]).unwrap();
+        let exclude = compile_globs(&[r"src\generated\**".to_string()]).unwrap();
+        let included = Path::new(r"C:\proj\src\contracts\lib.rs");
+        let excluded = Path::new(r"C:\proj\src\generated\bindings.rs");
+
+        assert!(glob_hit(&include, Path::new(r"src\contracts\lib.rs"), included));
+        assert!(glob_hit(&exclude, Path::new(r"src\generated\bindings.rs"), excluded));
+        assert!(!glob_hit(&exclude, Path::new(r"src\contracts\lib.rs"), included));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_emits_forward_slash_file_labels() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-windows-paths-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"windows-path-contract\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[contract]\npub struct C;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/skip.rs"), "pub fn excluded() {}").unwrap();
+
+        let checks = soroban_guard_checks::default_checks();
+        let (results, files_scanned, _, _) = scan_directory_with_checks(
+            &root,
+            &[r"src\skip.rs".to_string()],
+            &[r"src\*.rs".to_string()],
+            &checks,
+        )
+        .unwrap();
+
+        assert_eq!(files_scanned, 1);
+        assert_eq!(results[0].file_path, "src/lib.rs");
+        assert!(!results[0].file_path.contains('\\'));
+        assert!(!results[0].findings.is_empty());
+        assert!(results[0]
+            .findings
+            .iter()
+            .all(|finding| !finding.file_path.contains('\\')));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_profile_suppression_comment_hides_manifest_findings() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-release-profile-suppression-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"suppressed-contract\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "// soroban-guard: allow(release-profile-not-optimized)\n\
+             #[contract]\n\
+             pub struct C;\n",
+        )
+        .unwrap();
+
+        let (findings, _, _, panics) = scan_directory(&root, &[], &[]).unwrap();
+
+        assert!(panics.is_empty());
+        assert!(findings.iter().all(|finding| {
+            finding.check_name != "release-profile-not-optimized"
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_profile_uses_workspace_root_manifest_for_members() {
+        let root = std::env::temp_dir().join(format!(
+            "soroban-guard-workspace-profile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let member = root.join("contract");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"contract\"]\n\
+             [profile.release]\nopt-level = \"z\"\nlto = true\n\
+             panic = \"abort\"\ncodegen-units = 1\nstrip = \"symbols\"\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"workspace-contract\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("src/lib.rs"),
+            "#[contract]\npub struct C;\n",
+        )
+        .unwrap();
+
+        let (findings, _, _, panics) = scan_directory(&member, &[], &[]).unwrap();
+
+        assert!(panics.is_empty());
+        assert!(findings
+            .iter()
+            .all(|finding| finding.check_name != "release-profile-not-optimized"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
